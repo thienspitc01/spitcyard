@@ -154,10 +154,6 @@ const App: React.FC = () => {
   const [vessels, setVessels] = useState<string[]>([]);
   const [selectedVessels, setSelectedVessels] = useState<string[]>(['', '', '']);
 
-  // Ref để lưu trữ trạng thái request trước đó nhằm tránh thông báo lặp
-  const prevRequestsCount = useRef<number>(0);
-  const lastProcessedRequestId = useRef<string | null>(null);
-
   // Role Protection Effect
   useEffect(() => {
     if (user?.role === 'GATE') {
@@ -177,7 +173,6 @@ const App: React.FC = () => {
           const cloudRequests = await fetchTableData('yard_requests');
           if (cloudRequests.length > 0) {
             setRequests(cloudRequests);
-            prevRequestsCount.current = cloudRequests.length;
           }
           
           const inventoryData = await fetchTableData('yard_containers');
@@ -211,24 +206,31 @@ const App: React.FC = () => {
           }
         });
 
-        subscribeToChanges('yard_requests', (newData) => {
-           if (Array.isArray(newData)) {
+        // FIXED: Xử lý từng Request thay đổi (Realtime sync)
+        subscribeToChanges('yard_requests', (itemData: any) => {
+           if (itemData && itemData.id) {
              setRequests(prev => {
-                // Logic thông báo mạnh
+                const existing = prev.find(r => r.id === itemData.id);
+                
+                // --- Logic Thông báo mạnh dựa trên sự thay đổi trạng thái ---
                 if (user?.role === 'PLANNER') {
-                  const newPendings = newData.filter(r => r.status === 'pending');
-                  if (newPendings.length > prev.filter(r => r.status === 'pending').length) {
-                    triggerStrongNotification('YÊU CẦU MỚI', 'Cổng đang chờ cấp vị trí cho tàu ' + newPendings[newPendings.length - 1].vesselName);
+                  // Thông báo Planner khi có Request MỚI ở trạng thái pending
+                  if (!existing && itemData.status === 'pending') {
+                    triggerStrongNotification('YÊU CẦU MỚI', `Tàu ${itemData.vesselName} đang chờ cấp vị trí hạ bãi.`);
                   }
                 } else if (user?.role === 'GATE') {
-                  const newlyAssigned = newData.find(r => r.status === 'assigned' && !r.acknowledgedByGate);
-                  const prevAssigned = prev.find(r => r.id === newlyAssigned?.id);
-                  
-                  if (newlyAssigned && (!prevAssigned || prevAssigned.status === 'pending')) {
-                    triggerStrongNotification('ĐÃ CÓ VỊ TRÍ', `Vị trí bãi: ${newlyAssigned.assignedLocation} cho tàu ${newlyAssigned.vesselName}`);
+                  // Thông báo Gate khi Request của họ chuyển từ pending -> assigned
+                  if (existing && existing.status === 'pending' && itemData.status === 'assigned' && !itemData.acknowledgedByGate) {
+                    triggerStrongNotification('ĐÃ CÓ VỊ TRÍ', `Vị trí bãi: ${itemData.assignedLocation} cho tàu ${itemData.vesselName}`);
                   }
                 }
-                return newData;
+
+                // Cập nhật danh sách local
+                if (existing) {
+                  return prev.map(r => r.id === itemData.id ? itemData : r);
+                } else {
+                  return [...prev, itemData];
+                }
              });
            }
         });
@@ -244,9 +246,9 @@ const App: React.FC = () => {
   }, [cloudConfig, user]);
 
   const triggerStrongNotification = (title: string, body: string) => {
-    // 1. Kích hoạt còi báo động
+    // 1. Kích hoạt còi báo động (audioService)
     startAlarm();
-    // 2. Gửi sự kiện cho NotificationOverlay hiển thị đè màn hình
+    // 2. Kích hoạt Overlay khẩn cấp (thông báo hệ thống + UI đè màn hình)
     window.dispatchEvent(new CustomEvent('port-notification', { detail: { title, body } }));
   };
 
@@ -389,8 +391,8 @@ const App: React.FC = () => {
           onSubmit={(req) => {
             const newId = `REQ-${Date.now()}`;
             const newReq: ContainerRequest = { ...req, id: newId, status: 'pending', timestamp: Date.now() };
-            const updated = [...requests, newReq];
-            setRequests(updated);
+            // Cập nhật local ngay cho mượt, sau đó Cloud sẽ sync lại
+            setRequests(prev => [...prev, newReq]);
             if (isCloudConnected) syncTable('yard_requests', newId, newReq);
           }} 
           requests={requests} 
@@ -400,6 +402,7 @@ const App: React.FC = () => {
               const updatedReq = { ...req, acknowledgedByGate: true };
               if (isCloudConnected) syncTable('yard_requests', id, updatedReq);
             }
+            stopAlarm();
           }} 
         />
       )}
@@ -419,7 +422,10 @@ const App: React.FC = () => {
               containers={containers} 
               schedule={schedule} 
               blocks={blockConfigs} 
-              onAcknowledge={() => {}} 
+              onAcknowledge={(id) => {
+                // Tắt chuông khi Planner tương tác với Request
+                stopAlarm();
+              }} 
             />
           )}
           
